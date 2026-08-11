@@ -120,6 +120,31 @@ static void bytes_to_hex(const BYTE *buf, DWORD len, char *out, size_t out_size)
         out[pos < out_size ? pos : out_size - 1] = '\0';
 }
 
+/* Format a byte buffer as a compact hex string (no separators), for JSON. */
+static void hex_compact(const BYTE *buf, DWORD len, char *out, size_t out_size) {
+    size_t pos = 0;
+    for (DWORD i = 0; i < len && pos + 2 < out_size; i++)
+        pos += (size_t)snprintf(out + pos, out_size - pos, "%02X", buf[i]);
+    if (out_size > 0)
+        out[pos < out_size ? pos : out_size - 1] = '\0';
+}
+
+/* Print a JSON string literal with the necessary escaping. */
+static void json_str(const char *s) {
+    putchar('"');
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\') {
+            putchar('\\');
+            putchar(*s);
+        } else if ((unsigned char)*s < 0x20) {
+            printf("\\u%04x", (unsigned char)*s);
+        } else {
+            putchar(*s);
+        }
+    }
+    putchar('"');
+}
+
 /*
  * Identify the card type from the ATR (standard PC/SC ATR for contactless
  * cards): 3B 8F 80 01 <RID: A0 00 00 03 06> <SS> <name: NN NN> ... <TCK>
@@ -297,40 +322,77 @@ static void print_block(BYTE block, const BYTE *data) {
  * Blocks that authenticate are read and printed; the rest are reported as
  * locked with an unknown key.
  */
-static void dump_mifare_classic(SCARDHANDLE card, DWORD protocol) {
-    printf("\n--- MIFARE Classic memory dump (default keys only) ---\n");
+static void dump_mifare_classic(SCARDHANDLE card, DWORD protocol, int json) {
+    if (!json)
+        printf("\n--- MIFARE Classic memory dump ---\n");
+    else
+        printf(",\"dump\":{\"sectors\":[");
+
     int readable = 0;
     for (BYTE sector = 0; sector < 16; sector++) {
         BYTE first = (BYTE)(sector * 4);
         char kt = '?';
         const BYTE *key = NULL;
+        int locked = !find_sector_key(card, protocol, first, &kt, &key);
 
-        if (!find_sector_key(card, protocol, first, &kt, &key)) {
-            printf("  sector %2u : no known key worked (locked)\n", sector);
-            continue;
+        if (json) {
+            printf("%s{\"sector\":%u", sector ? "," : "", sector);
+            if (locked) {
+                printf(",\"locked\":true}");
+                continue;
+            }
+            char key_hex[13];
+            hex_compact(key, 6, key_hex, sizeof(key_hex));
+            printf(",\"locked\":false,\"key\":\"%s\",\"key_type\":\"%c\",\"blocks\":[",
+                   key_hex, kt);
+        } else {
+            if (locked) {
+                printf("  sector %2u : no known key worked (locked)\n", sector);
+                continue;
+            }
+            char key_hex[3 * 6 + 1];
+            bytes_to_hex(key, 6, key_hex, sizeof(key_hex));
+            printf("  sector %2u : key %c = %s\n", sector, kt, key_hex);
         }
-
-        char key_hex[3 * 6 + 1];
-        bytes_to_hex(key, 6, key_hex, sizeof(key_hex));
-        printf("  sector %2u : key %c = %s\n", sector, kt, key_hex);
 
         for (BYTE b = first; b < first + 4; b++) {
             BYTE data[16];
             /* Re-authenticate per block; some readers require it. */
             authenticate(card, protocol, b, kt == 'A' ? 0x60 : 0x61);
-            if (read_block(card, protocol, b, data)) {
-                print_block(b, data);
+            int ok = read_block(card, protocol, b, data);
+            if (ok)
                 readable++;
+
+            if (json) {
+                if (b != first)
+                    putchar(',');
+                if (ok) {
+                    char h[33];
+                    hex_compact(data, 16, h, sizeof(h));
+                    printf("\"%s\"", h);
+                } else {
+                    printf("null");
+                }
+            } else if (ok) {
+                print_block(b, data);
             } else {
                 printf("    block %2u : (read failed)\n", b);
             }
         }
+
+        if (json)
+            printf("]}");
     }
-    printf("--- %d of 64 blocks read ---\n", readable);
+
+    if (json)
+        printf("],\"blocks_read\":%d}", readable);
+    else
+        printf("--- %d of 64 blocks read ---\n", readable);
 }
 
 /* Handle a card once it is present: connect, read ATR + UID, optionally dump. */
-static void handle_card(SCARDCONTEXT ctx, const char *reader, int want_dump) {
+static void handle_card(SCARDCONTEXT ctx, const char *reader,
+                        int want_dump, int want_json) {
     SCARDHANDLE card;
     DWORD protocol = 0;
 
@@ -366,16 +428,29 @@ static void handle_card(SCARDCONTEXT ctx, const char *reader, int want_dump) {
     if (read_uid(card, protocol, uid, &uid_len))
         bytes_to_hex(uid, uid_len, uid_hex, sizeof(uid_hex));
 
-    printf("\n=== Card detected ===\n");
-    printf("  UID  : %s\n", uid_hex);
-    printf("  Type : %s\n", type);
-    printf("  ATR  : %s\n", atr_hex);
-
-    if (want_dump) {
-        if (classic)
-            dump_mifare_classic(card, protocol);
-        else
-            printf("  (dump: only MIFARE Classic is supported)\n");
+    if (want_json) {
+        char uid_c[3 * 64 + 1] = "", atr_c[3 * MAX_ATR_SIZE + 1] = "";
+        hex_compact(uid, uid_len, uid_c, sizeof(uid_c));
+        hex_compact(atr, atr_len, atr_c, sizeof(atr_c));
+        printf("{\"reader\":");
+        json_str(reader);
+        printf(",\"uid\":\"%s\",\"type\":", uid_c);
+        json_str(type);
+        printf(",\"atr\":\"%s\"", atr_c);
+        if (want_dump && classic)
+            dump_mifare_classic(card, protocol, 1);
+        printf("}\n");
+    } else {
+        printf("\n=== Card detected ===\n");
+        printf("  UID  : %s\n", uid_hex);
+        printf("  Type : %s\n", type);
+        printf("  ATR  : %s\n", atr_hex);
+        if (want_dump) {
+            if (classic)
+                dump_mifare_classic(card, protocol, 0);
+            else
+                printf("  (dump: only MIFARE Classic is supported)\n");
+        }
     }
     fflush(stdout);
 
@@ -437,12 +512,13 @@ static void print_usage(const char *prog) {
     printf("  <name>         use the first reader whose name contains <name>\n");
     printf("  -d, --dump     also dump MIFARE Classic sectors (default keys)\n");
     printf("  -k, --keys <f> add extra MIFARE keys from file <f> (implies -d)\n");
+    printf("  -j, --json     output as JSON (one object per card, on stdout)\n");
     printf("  -l, --list     list connected readers and exit\n");
     printf("  -h, --help     show this help and exit\n");
 }
 
 int main(int argc, char **argv) {
-    int want_dump = 0, want_list = 0;
+    int want_dump = 0, want_list = 0, want_json = 0;
     const char *selector = NULL;
     const char *keys_path = NULL;
 
@@ -453,6 +529,8 @@ int main(int argc, char **argv) {
             return 0;
         } else if (strcmp(a, "-d") == 0 || strcmp(a, "--dump") == 0) {
             want_dump = 1;
+        } else if (strcmp(a, "-j") == 0 || strcmp(a, "--json") == 0) {
+            want_json = 1;
         } else if (strcmp(a, "-k") == 0 || strcmp(a, "--keys") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s requires a file argument\n", a);
@@ -467,13 +545,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* In JSON mode keep stdout pure JSON; status messages go to stderr. */
+    FILE *info = want_json ? stderr : stdout;
+
     if (keys_path) {
         int loaded = load_keys_file(keys_path);
         if (loaded < 0) {
             fprintf(stderr, "could not read keys file: %s\n", keys_path);
             return 1;
         }
-        printf("Loaded %d extra key(s) from %s\n", loaded, keys_path);
+        fprintf(info, "Loaded %d extra key(s) from %s\n", loaded, keys_path);
     }
 
     /* Install handlers with sigaction() WITHOUT SA_RESTART; see on_signal(). */
@@ -499,9 +580,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("Readers found (%d):\n", n);
+    fprintf(info, "Readers found (%d):\n", n);
     for (int i = 0; i < n; i++)
-        printf("  [%d] %s\n", i, names[i]);
+        fprintf(info, "  [%d] %s\n", i, names[i]);
 
     if (want_list) {
         free(readers_buf);
@@ -518,12 +599,12 @@ int main(int argc, char **argv) {
     }
 
     const char *reader = names[selected];
-    printf("\nUsing reader [%d]: %s\n", selected, reader);
+    fprintf(info, "\nUsing reader [%d]: %s\n", selected, reader);
     if (n > 1 && !selector)
-        printf("(select another with: %s <index> or %s <name>)\n",
-               argv[0], argv[0]);
-    printf("Place a card on the reader … (Ctrl-C to quit)\n");
-    fflush(stdout);
+        fprintf(info, "(select another with: %s <index> or %s <name>)\n",
+                argv[0], argv[0]);
+    fprintf(info, "Place a card on the reader … (Ctrl-C to quit)\n");
+    fflush(info);
 
     SCARD_READERSTATE rs;
     memset(&rs, 0, sizeof(rs));
@@ -544,13 +625,13 @@ int main(int argc, char **argv) {
         /* Card newly present (rising edge only). */
         if ((rs.dwEventState & SCARD_STATE_PRESENT) &&
             !(rs.dwCurrentState & SCARD_STATE_PRESENT)) {
-            handle_card(g_ctx, reader, want_dump);
+            handle_card(g_ctx, reader, want_dump, want_json);
         }
 
         rs.dwCurrentState = rs.dwEventState;
     }
 
-    printf("\nBye.\n");
+    fprintf(info, "\nBye.\n");
     free(readers_buf);
     SCardReleaseContext(g_ctx);
     return 0;

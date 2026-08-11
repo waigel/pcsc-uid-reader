@@ -26,11 +26,23 @@ This produces the `pcsc-uid-reader` binary.
 ./pcsc-uid-reader -l         # list connected readers and exit
 ./pcsc-uid-reader -h         # show help
 ./pcsc-uid-reader -d         # also dump MIFARE Classic sectors (default keys)
+./pcsc-uid-reader -j         # emit JSON on stdout (one object per card)
 ./pcsc-uid-reader 1          # use the reader with index 1
 ./pcsc-uid-reader OMNIKEY    # use the first reader whose name contains "OMNIKEY"
 ```
 
 Flags and the reader selector can be combined, e.g. `./pcsc-uid-reader -d OMNIKEY`.
+
+With `-j`, stdout carries one JSON object per detected card (status text goes to
+stderr), so it pipes cleanly into tools like `jq`:
+
+```bash
+./pcsc-uid-reader -j OMNIKEY | jq '{uid, type}'
+```
+
+Shape: `{"reader","uid","type","atr"}`, plus `"dump":{"sectors":[…],"blocks_read"}`
+when dumping. Each sector is either `{"sector","locked":true}` or
+`{"sector","locked":false,"key","key_type","blocks":[…]}`.
 
 Place a card on the reader — its UID, type and ATR are printed. Press `Ctrl-C`
 to quit.

@@ -25,9 +25,12 @@ This produces the `pcsc-uid-reader` binary.
 ./pcsc-uid-reader            # use the first reader, wait for a card
 ./pcsc-uid-reader -l         # list connected readers and exit
 ./pcsc-uid-reader -h         # show help
+./pcsc-uid-reader -d         # also dump MIFARE Classic sectors (default keys)
 ./pcsc-uid-reader 1          # use the reader with index 1
 ./pcsc-uid-reader OMNIKEY    # use the first reader whose name contains "OMNIKEY"
 ```
+
+Flags and the reader selector can be combined, e.g. `./pcsc-uid-reader -d OMNIKEY`.
 
 Place a card on the reader — its UID, type and ATR are printed. Press `Ctrl-C`
 to quit.
@@ -56,12 +59,33 @@ Place a card on the reader … (Ctrl-C to quit)
   historical bytes (the standard PC/SC contactless ATR encodes the card name).
 - APDU `FF CA 00 00 00` via `SCardTransmit` — read the UID.
 
+## Dumping MIFARE Classic sectors (`-d`)
+
+With `-d`, once a MIFARE Classic card is detected the tool tries a small
+dictionary of **factory-default keys** against every sector (`FF 82` load key,
+`FF 86` authenticate, `FF B0` read binary) and prints the blocks it can read as
+hex and ASCII. Sectors protected with non-default keys are reported as locked.
+
+```
+--- MIFARE Classic memory dump (default keys only) ---
+  sector  0 : key A = FF FF FF FF FF FF
+    block  0 : DE AD BE EF 00 08 04 00 62 63 64 65 66 67 68 69  |........bcdefghi|
+    block  1 : 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+    block  2 : 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+    block  3 : 00 00 00 00 00 00 FF 07 80 69 FF FF FF FF FF FF  |.........i......|
+  sector  4 : no default key worked (locked)
+  ...
+```
+
+It uses **only well-known default keys** — no CRYPTO1 key-recovery attack is
+implemented. Sectors with custom keys require dedicated hardware/tooling (e.g.
+a Proxmark3) that is out of scope here. Intended for inspecting your own cards.
+
 ## Scope and limitations
 
-- **UID only.** The tool reads the UID (via `FF CA 00 00 00`), which is enough
-  to identify a card. Reading the memory blocks of a MIFARE Classic card would
-  additionally require the sector keys and the `FF 86` authenticate + `FF B0`
-  read APDUs — not implemented here.
+- **UID and default-key sectors.** The tool reads the UID (via `FF CA 00 00 00`)
+  and, with `-d`, any MIFARE Classic sectors still protected by factory-default
+  keys. Sectors with custom keys are not accessible.
 - **Contactless PC/SC readers.** A contact-only reader cannot read contactless
   cards. Cheap "keyboard-wedge" readers that type the UID as text do not appear
   in PC/SC and are not supported by this tool.

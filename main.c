@@ -5,18 +5,26 @@
  *
  * Built on the native winscard API (PCSC.framework).
  * Place a card on the reader and its UID, detected type and ATR are printed.
+ * With --dump, MIFARE Classic sectors are read using a dictionary of default
+ * keys (CRYPTO1 authentication via the standard PC/SC pseudo-APDUs).
  *
  * Usage:
  *   pcsc-uid-reader            use the first reader, wait for a card
  *   pcsc-uid-reader -l         list connected readers and exit
  *   pcsc-uid-reader -h         show this help
+ *   pcsc-uid-reader -d         also dump MIFARE Classic sectors (default keys)
  *   pcsc-uid-reader 1          use the reader with index 1
  *   pcsc-uid-reader ACR122     use the first reader whose name contains "ACR122"
+ *
+ * The dump feature uses only well-known factory-default keys; it does not
+ * implement any CRYPTO1 key-recovery attack. Intended for inspecting your own
+ * cards and for learning purposes.
  */
 
 #include <PCSC/winscard.h>
 #include <PCSC/wintypes.h>
 
+#include <ctype.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +48,26 @@ static void on_signal(int sig) {
     if (g_ctx)
         SCardCancel(g_ctx);
 }
+
+/* Well-known factory-default MIFARE Classic keys (6 bytes each). */
+static const BYTE DEFAULT_KEYS[][6] = {
+    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+    {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5},
+    {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    {0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0},
+    {0xA1, 0xB1, 0xC1, 0xD1, 0xE1, 0xF1},
+    {0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5},
+    {0x4D, 0x3A, 0x99, 0xC3, 0x51, 0xDD},
+    {0x1A, 0x98, 0x2C, 0x7E, 0x45, 0x9A},
+    {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
+    {0x71, 0x4C, 0x5C, 0x88, 0x6E, 0x97},
+    {0x58, 0x7E, 0xE5, 0xF9, 0x35, 0x0F},
+    {0xA0, 0x47, 0x8C, 0xC3, 0x90, 0x91},
+    {0x53, 0x3C, 0xB6, 0xC7, 0x23, 0xF6},
+    {0x8F, 0xD0, 0xA4, 0xF2, 0x56, 0xE9},
+};
+#define NUM_DEFAULT_KEYS (sizeof(DEFAULT_KEYS) / sizeof(DEFAULT_KEYS[0]))
 
 /* Format a byte buffer as a hex string, e.g. "04 A2 3F". */
 static void bytes_to_hex(const BYTE *buf, DWORD len, char *out, size_t out_size) {
@@ -104,35 +132,151 @@ static const char *identify_card(const BYTE *atr, DWORD atr_len) {
     return "unknown (see ATR name bytes)";
 }
 
-/* Read the card UID via APDU FF CA 00 00 00. */
-static LONG read_uid(SCARDHANDLE card, DWORD protocol,
-                     BYTE *uid, DWORD *uid_len) {
-    const SCARD_IO_REQUEST *pci =
-        (protocol == SCARD_PROTOCOL_T1) ? SCARD_PCI_T1 : SCARD_PCI_T0;
-
-    BYTE get_uid[] = {0xFF, 0xCA, 0x00, 0x00, 0x00};
-    BYTE resp[258];
-    DWORD resp_len = sizeof(resp);
-
-    LONG rv = SCardTransmit(card, pci, get_uid, sizeof(get_uid),
-                            NULL, resp, &resp_len);
-    if (rv != SCARD_S_SUCCESS)
-        return rv;
-
-    /* The response ends with status word SW1 SW2 = 90 00 on success. */
-    if (resp_len < 2 || resp[resp_len - 2] != 0x90 || resp[resp_len - 1] != 0x00)
-        return SCARD_F_UNKNOWN_ERROR;
-
-    DWORD n = resp_len - 2;
-    if (n > *uid_len)
-        n = *uid_len;
-    memcpy(uid, resp, n);
-    *uid_len = n;
-    return SCARD_S_SUCCESS;
+/* True if the ATR identifies a MIFARE Classic 1K or 4K card. */
+static int is_mifare_classic(const BYTE *atr, DWORD atr_len) {
+    const char *t = identify_card(atr, atr_len);
+    return strncmp(t, "MIFARE Classic", 14) == 0;
 }
 
-/* Handle a card once it is present: connect, read ATR + UID, print. */
-static void handle_card(SCARDCONTEXT ctx, const char *reader) {
+/* Select the IO request block for the active protocol. */
+static const SCARD_IO_REQUEST *pci_for(DWORD protocol) {
+    return (protocol == SCARD_PROTOCOL_T1) ? SCARD_PCI_T1 : SCARD_PCI_T0;
+}
+
+/*
+ * Send an APDU and return 1 if the response status word is 90 00.
+ * The response payload (without SW) is copied to out/out_len when provided.
+ */
+static int send_apdu(SCARDHANDLE card, DWORD protocol,
+                     const BYTE *apdu, DWORD apdu_len,
+                     BYTE *out, DWORD *out_len) {
+    BYTE resp[258];
+    DWORD resp_len = sizeof(resp);
+    LONG rv = SCardTransmit(card, pci_for(protocol), apdu, apdu_len,
+                            NULL, resp, &resp_len);
+    if (rv != SCARD_S_SUCCESS || resp_len < 2)
+        return 0;
+    if (resp[resp_len - 2] != 0x90 || resp[resp_len - 1] != 0x00)
+        return 0;
+
+    if (out && out_len) {
+        DWORD n = resp_len - 2;
+        if (n > *out_len)
+            n = *out_len;
+        memcpy(out, resp, n);
+        *out_len = n;
+    }
+    return 1;
+}
+
+/* Read the card UID via APDU FF CA 00 00 00. */
+static int read_uid(SCARDHANDLE card, DWORD protocol, BYTE *uid, DWORD *uid_len) {
+    BYTE get_uid[] = {0xFF, 0xCA, 0x00, 0x00, 0x00};
+    return send_apdu(card, protocol, get_uid, sizeof(get_uid), uid, uid_len);
+}
+
+/*
+ * Load a 6-byte key into the reader's key slot 0 (FF 82).
+ * Readers disagree on the key structure byte (P1): the ACS ACR122U wants
+ * 0x00 (volatile) while the HID OMNIKEY 5022 requires 0x20 (non-volatile),
+ * so try volatile first and fall back to non-volatile.
+ */
+static int load_key(SCARDHANDLE card, DWORD protocol, const BYTE *key) {
+    BYTE apdu[11] = {0xFF, 0x82, 0x00, 0x00, 0x06};
+    memcpy(apdu + 5, key, 6);
+    if (send_apdu(card, protocol, apdu, sizeof(apdu), NULL, NULL))
+        return 1;
+    apdu[2] = 0x20; /* non-volatile key location */
+    return send_apdu(card, protocol, apdu, sizeof(apdu), NULL, NULL);
+}
+
+/* Authenticate a block with the loaded key (FF 86). key_type: 0x60=A, 0x61=B. */
+static int authenticate(SCARDHANDLE card, DWORD protocol, BYTE block, BYTE key_type) {
+    BYTE apdu[] = {0xFF, 0x86, 0x00, 0x00, 0x05,
+                   0x01, 0x00, block, key_type, 0x00};
+    return send_apdu(card, protocol, apdu, sizeof(apdu), NULL, NULL);
+}
+
+/* Read 16 bytes from a block (FF B0). */
+static int read_block(SCARDHANDLE card, DWORD protocol, BYTE block, BYTE *out16) {
+    BYTE apdu[] = {0xFF, 0xB0, 0x00, block, 0x10};
+    DWORD len = 16;
+    return send_apdu(card, protocol, apdu, sizeof(apdu), out16, &len) && len == 16;
+}
+
+/*
+ * Try every default key (Key A then Key B) against the sector's first block.
+ * On success returns 1 and reports the key type ('A'/'B') and key index.
+ */
+static int find_sector_key(SCARDHANDLE card, DWORD protocol, BYTE first_block,
+                           char *key_type_out, int *key_idx_out) {
+    for (size_t k = 0; k < NUM_DEFAULT_KEYS; k++) {
+        if (!load_key(card, protocol, DEFAULT_KEYS[k]))
+            continue;
+        if (authenticate(card, protocol, first_block, 0x60)) {
+            *key_type_out = 'A';
+            *key_idx_out = (int)k;
+            return 1;
+        }
+        if (authenticate(card, protocol, first_block, 0x61)) {
+            *key_type_out = 'B';
+            *key_idx_out = (int)k;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Print one block as hex plus a printable-ASCII rendering. */
+static void print_block(BYTE block, const BYTE *data) {
+    char hex[3 * 16 + 1];
+    bytes_to_hex(data, 16, hex, sizeof(hex));
+    char ascii[17];
+    for (int i = 0; i < 16; i++)
+        ascii[i] = isprint(data[i]) ? (char)data[i] : '.';
+    ascii[16] = '\0';
+    printf("    block %2u : %s  |%s|\n", block, hex, ascii);
+}
+
+/*
+ * Dump all 16 sectors of a MIFARE Classic 1K, trying default keys per sector.
+ * Blocks that authenticate are read and printed; the rest are reported as
+ * locked with an unknown key.
+ */
+static void dump_mifare_classic(SCARDHANDLE card, DWORD protocol) {
+    printf("\n--- MIFARE Classic memory dump (default keys only) ---\n");
+    int readable = 0;
+    for (BYTE sector = 0; sector < 16; sector++) {
+        BYTE first = (BYTE)(sector * 4);
+        char kt = '?';
+        int ki = -1;
+
+        if (!find_sector_key(card, protocol, first, &kt, &ki)) {
+            printf("  sector %2u : no default key worked (locked)\n", sector);
+            continue;
+        }
+
+        char key_hex[3 * 6 + 1];
+        bytes_to_hex(DEFAULT_KEYS[ki], 6, key_hex, sizeof(key_hex));
+        printf("  sector %2u : key %c = %s\n", sector, kt, key_hex);
+
+        for (BYTE b = first; b < first + 4; b++) {
+            BYTE data[16];
+            /* Re-authenticate per block; some readers require it. */
+            authenticate(card, protocol, b, kt == 'A' ? 0x60 : 0x61);
+            if (read_block(card, protocol, b, data)) {
+                print_block(b, data);
+                readable++;
+            } else {
+                printf("    block %2u : (read failed)\n", b);
+            }
+        }
+    }
+    printf("--- %d of 64 blocks read ---\n", readable);
+}
+
+/* Handle a card once it is present: connect, read ATR + UID, optionally dump. */
+static void handle_card(SCARDCONTEXT ctx, const char *reader, int want_dump) {
     SCARDHANDLE card;
     DWORD protocol = 0;
 
@@ -155,21 +299,30 @@ static void handle_card(SCARDCONTEXT ctx, const char *reader) {
 
     char atr_hex[3 * MAX_ATR_SIZE + 1] = "(unavailable)";
     const char *type = "unknown";
+    int classic = 0;
     if (rv == SCARD_S_SUCCESS) {
         bytes_to_hex(atr, atr_len, atr_hex, sizeof(atr_hex));
         type = identify_card(atr, atr_len);
+        classic = is_mifare_classic(atr, atr_len);
     }
 
     BYTE uid[64];
     DWORD uid_len = sizeof(uid);
     char uid_hex[3 * 64 + 1] = "(not readable — contact card or no UID support)";
-    if (read_uid(card, protocol, uid, &uid_len) == SCARD_S_SUCCESS)
+    if (read_uid(card, protocol, uid, &uid_len))
         bytes_to_hex(uid, uid_len, uid_hex, sizeof(uid_hex));
 
     printf("\n=== Card detected ===\n");
     printf("  UID  : %s\n", uid_hex);
     printf("  Type : %s\n", type);
     printf("  ATR  : %s\n", atr_hex);
+
+    if (want_dump) {
+        if (classic)
+            dump_mifare_classic(card, protocol);
+        else
+            printf("  (dump: only MIFARE Classic is supported)\n");
+    }
     fflush(stdout);
 
     SCardDisconnect(card, SCARD_LEAVE_CARD);
@@ -210,10 +363,12 @@ static int select_reader(const char *arg, const char *names[], int n) {
     if (!arg)
         return 0;
 
+    /* A pure, in-range number selects by index; otherwise fall back to a
+     * name substring match (so "5022" matches a reader named "… 5022 …"). */
     char *end = NULL;
     long idx = strtol(arg, &end, 10);
-    if (*end == '\0')
-        return (idx >= 0 && idx < n) ? (int)idx : -1;
+    if (*end == '\0' && idx >= 0 && idx < n)
+        return (int)idx;
 
     for (int i = 0; i < n; i++)
         if (strstr(names[i], arg))
@@ -222,24 +377,34 @@ static int select_reader(const char *arg, const char *names[], int n) {
 }
 
 static void print_usage(const char *prog) {
-    printf("Usage: %s [reader | -l | -h]\n", prog);
+    printf("Usage: %s [reader] [-d] [-l] [-h]\n", prog);
     printf("  (no argument)  use the first reader and wait for a card\n");
     printf("  <index>        use the reader with that index\n");
     printf("  <name>         use the first reader whose name contains <name>\n");
+    printf("  -d, --dump     also dump MIFARE Classic sectors (default keys)\n");
     printf("  -l, --list     list connected readers and exit\n");
     printf("  -h, --help     show this help and exit\n");
 }
 
 int main(int argc, char **argv) {
-    const char *arg = (argc > 1) ? argv[1] : NULL;
-    if (arg && (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0)) {
-        print_usage(argv[0]);
-        return 0;
+    int want_dump = 0, want_list = 0;
+    const char *selector = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (strcmp(a, "-d") == 0 || strcmp(a, "--dump") == 0) {
+            want_dump = 1;
+        } else if (strcmp(a, "-l") == 0 || strcmp(a, "--list") == 0) {
+            want_list = 1;
+        } else if (!selector) {
+            selector = a;
+        }
     }
 
-    /*
-     * Install handlers with sigaction() WITHOUT SA_RESTART; see on_signal().
-     */
+    /* Install handlers with sigaction() WITHOUT SA_RESTART; see on_signal(). */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
@@ -266,15 +431,15 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++)
         printf("  [%d] %s\n", i, names[i]);
 
-    if (arg && (strcmp(arg, "-l") == 0 || strcmp(arg, "--list") == 0)) {
+    if (want_list) {
         free(readers_buf);
         SCardReleaseContext(g_ctx);
         return 0;
     }
 
-    int selected = select_reader(arg, names, n);
+    int selected = select_reader(selector, names, n);
     if (selected < 0) {
-        fprintf(stderr, "no reader matches \"%s\".\n", arg);
+        fprintf(stderr, "no reader matches \"%s\".\n", selector);
         free(readers_buf);
         SCardReleaseContext(g_ctx);
         return 1;
@@ -282,7 +447,7 @@ int main(int argc, char **argv) {
 
     const char *reader = names[selected];
     printf("\nUsing reader [%d]: %s\n", selected, reader);
-    if (n > 1 && !arg)
+    if (n > 1 && !selector)
         printf("(select another with: %s <index> or %s <name>)\n",
                argv[0], argv[0]);
     printf("Place a card on the reader … (Ctrl-C to quit)\n");
@@ -307,7 +472,7 @@ int main(int argc, char **argv) {
         /* Card newly present (rising edge only). */
         if ((rs.dwEventState & SCARD_STATE_PRESENT) &&
             !(rs.dwCurrentState & SCARD_STATE_PRESENT)) {
-            handle_card(g_ctx, reader);
+            handle_card(g_ctx, reader, want_dump);
         }
 
         rs.dwCurrentState = rs.dwEventState;

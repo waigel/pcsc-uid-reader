@@ -1,0 +1,7 @@
+# Build output
+pcsc-uid-reader
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store

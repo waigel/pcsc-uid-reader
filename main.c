@@ -69,6 +69,46 @@ static const BYTE DEFAULT_KEYS[][6] = {
 };
 #define NUM_DEFAULT_KEYS (sizeof(DEFAULT_KEYS) / sizeof(DEFAULT_KEYS[0]))
 
+/* Extra keys loaded at runtime via --keys <file>, tried before the defaults. */
+#define MAX_USER_KEYS 256
+static BYTE g_user_keys[MAX_USER_KEYS][6];
+static int g_num_user_keys = 0;
+
+/*
+ * Load candidate keys from a text file: one key per line as 12 hex digits,
+ * spaces optional ("A0B0C0D0E0F0" or "A0 B0 C0 D0 E0 F0"); '#' starts a
+ * comment. Returns the number of keys loaded, or -1 if the file can't be read.
+ */
+static int load_keys_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f) && g_num_user_keys < MAX_USER_KEYS) {
+        char hex[16];
+        int h = 0;
+        for (char *p = line; *p && h < (int)sizeof(hex) - 1; p++) {
+            if (*p == '#')
+                break;
+            if (isxdigit((unsigned char)*p))
+                hex[h++] = *p;
+        }
+        hex[h] = '\0';
+        if (h != 12)
+            continue; /* need exactly 6 bytes */
+
+        for (int i = 0; i < 6; i++) {
+            unsigned int v;
+            sscanf(hex + i * 2, "%2x", &v);
+            g_user_keys[g_num_user_keys][i] = (BYTE)v;
+        }
+        g_num_user_keys++;
+    }
+    fclose(f);
+    return g_num_user_keys;
+}
+
 /* Format a byte buffer as a hex string, e.g. "04 A2 3F". */
 static void bytes_to_hex(const BYTE *buf, DWORD len, char *out, size_t out_size) {
     size_t pos = 0;
@@ -205,26 +245,40 @@ static int read_block(SCARDHANDLE card, DWORD protocol, BYTE block, BYTE *out16)
 }
 
 /*
- * Try every default key (Key A then Key B) against the sector's first block.
- * On success returns 1 and reports the key type ('A'/'B') and key index.
+ * Try a list of keys (Key A then Key B) against a block. On success returns 1
+ * and reports the key type ('A'/'B') and a pointer to the matching key.
  */
-static int find_sector_key(SCARDHANDLE card, DWORD protocol, BYTE first_block,
-                           char *key_type_out, int *key_idx_out) {
-    for (size_t k = 0; k < NUM_DEFAULT_KEYS; k++) {
-        if (!load_key(card, protocol, DEFAULT_KEYS[k]))
+static int try_key_list(SCARDHANDLE card, DWORD protocol, BYTE block,
+                        const BYTE keys[][6], int count,
+                        char *key_type_out, const BYTE **key_out) {
+    for (int k = 0; k < count; k++) {
+        if (!load_key(card, protocol, keys[k]))
             continue;
-        if (authenticate(card, protocol, first_block, 0x60)) {
+        if (authenticate(card, protocol, block, 0x60)) {
             *key_type_out = 'A';
-            *key_idx_out = (int)k;
+            *key_out = keys[k];
             return 1;
         }
-        if (authenticate(card, protocol, first_block, 0x61)) {
+        if (authenticate(card, protocol, block, 0x61)) {
             *key_type_out = 'B';
-            *key_idx_out = (int)k;
+            *key_out = keys[k];
             return 1;
         }
     }
     return 0;
+}
+
+/*
+ * Find a working key for the sector's first block: user-provided keys first,
+ * then the factory defaults. Reports the key type and the matching key bytes.
+ */
+static int find_sector_key(SCARDHANDLE card, DWORD protocol, BYTE first_block,
+                           char *key_type_out, const BYTE **key_out) {
+    if (try_key_list(card, protocol, first_block, g_user_keys, g_num_user_keys,
+                     key_type_out, key_out))
+        return 1;
+    return try_key_list(card, protocol, first_block, DEFAULT_KEYS,
+                        (int)NUM_DEFAULT_KEYS, key_type_out, key_out);
 }
 
 /* Print one block as hex plus a printable-ASCII rendering. */
@@ -249,15 +303,15 @@ static void dump_mifare_classic(SCARDHANDLE card, DWORD protocol) {
     for (BYTE sector = 0; sector < 16; sector++) {
         BYTE first = (BYTE)(sector * 4);
         char kt = '?';
-        int ki = -1;
+        const BYTE *key = NULL;
 
-        if (!find_sector_key(card, protocol, first, &kt, &ki)) {
-            printf("  sector %2u : no default key worked (locked)\n", sector);
+        if (!find_sector_key(card, protocol, first, &kt, &key)) {
+            printf("  sector %2u : no known key worked (locked)\n", sector);
             continue;
         }
 
         char key_hex[3 * 6 + 1];
-        bytes_to_hex(DEFAULT_KEYS[ki], 6, key_hex, sizeof(key_hex));
+        bytes_to_hex(key, 6, key_hex, sizeof(key_hex));
         printf("  sector %2u : key %c = %s\n", sector, kt, key_hex);
 
         for (BYTE b = first; b < first + 4; b++) {
@@ -377,11 +431,12 @@ static int select_reader(const char *arg, const char *names[], int n) {
 }
 
 static void print_usage(const char *prog) {
-    printf("Usage: %s [reader] [-d] [-l] [-h]\n", prog);
+    printf("Usage: %s [reader] [-d] [-k <file>] [-l] [-h]\n", prog);
     printf("  (no argument)  use the first reader and wait for a card\n");
     printf("  <index>        use the reader with that index\n");
     printf("  <name>         use the first reader whose name contains <name>\n");
     printf("  -d, --dump     also dump MIFARE Classic sectors (default keys)\n");
+    printf("  -k, --keys <f> add extra MIFARE keys from file <f> (implies -d)\n");
     printf("  -l, --list     list connected readers and exit\n");
     printf("  -h, --help     show this help and exit\n");
 }
@@ -389,6 +444,7 @@ static void print_usage(const char *prog) {
 int main(int argc, char **argv) {
     int want_dump = 0, want_list = 0;
     const char *selector = NULL;
+    const char *keys_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -397,11 +453,27 @@ int main(int argc, char **argv) {
             return 0;
         } else if (strcmp(a, "-d") == 0 || strcmp(a, "--dump") == 0) {
             want_dump = 1;
+        } else if (strcmp(a, "-k") == 0 || strcmp(a, "--keys") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s requires a file argument\n", a);
+                return 1;
+            }
+            keys_path = argv[++i];
+            want_dump = 1; /* providing keys implies a dump */
         } else if (strcmp(a, "-l") == 0 || strcmp(a, "--list") == 0) {
             want_list = 1;
         } else if (!selector) {
             selector = a;
         }
+    }
+
+    if (keys_path) {
+        int loaded = load_keys_file(keys_path);
+        if (loaded < 0) {
+            fprintf(stderr, "could not read keys file: %s\n", keys_path);
+            return 1;
+        }
+        printf("Loaded %d extra key(s) from %s\n", loaded, keys_path);
     }
 
     /* Install handlers with sigaction() WITHOUT SA_RESTART; see on_signal(). */

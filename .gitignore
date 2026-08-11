@@ -5,3 +5,8 @@ pcsc-uid-reader
 
 # macOS
 .DS_Store
+
+# Real key files and card dumps are secrets — never commit them
+*.keys
+keys.txt
+*.nfc

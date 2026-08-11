@@ -79,7 +79,22 @@ hex and ASCII. Sectors protected with non-default keys are reported as locked.
 
 It uses **only well-known default keys** — no CRYPTO1 key-recovery attack is
 implemented. Sectors with custom keys require dedicated hardware/tooling (e.g.
-a Proxmark3) that is out of scope here. Intended for inspecting your own cards.
+a Proxmark3 or Flipper Zero) that is out of scope here. Intended for inspecting
+your own cards.
+
+### Supplying your own keys (`-k`)
+
+If you already know the keys for the protected sectors (recovered elsewhere),
+pass them in a key file so the tool can read those sectors too:
+
+```bash
+./pcsc-uid-reader -k mykeys.txt OMNIKEY
+```
+
+The file lists one key per line as 12 hex digits (spaces optional, `#` starts a
+comment); see [keys.example.txt](keys.example.txt). Your keys are tried before
+the built-in defaults. `-k` implies `-d`. Keep real key files out of version
+control — they are secrets.
 
 ## Scope and limitations
 

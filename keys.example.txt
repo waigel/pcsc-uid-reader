@@ -1,0 +1,12 @@
+# Example key file for pcsc-uid-reader --keys
+#
+# One MIFARE key per line, 12 hex digits. Spaces are ignored, so both
+# "A0B0C0D0E0F0" and "A0 B0 C0 D0 E0 F0" work. Lines starting with '#'
+# (or text after a '#') are comments.
+#
+# These are EXAMPLE / placeholder keys — replace them with your own.
+# Recovered keys are secrets: keep your real key file out of version control.
+
+A0B0C0D0E0F0
+A1B1C1D1E1F1
+112233445566
